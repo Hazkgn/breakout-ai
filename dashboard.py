@@ -3,29 +3,39 @@ import requests
 import pandas as pd
 import plotly.graph_objects as go
 import ta
+import threading
+import time
+import numpy as np
 
-st.set_page_config(page_title="Breakout AI Pro", layout="wide")
-st.title("🚀 Breakout Trading AI - Cloud Version")
+st.set_page_config(page_title="Breakout AI PRO", layout="wide")
+st.title("🚀 Breakout AI - Futures Edge Edition")
 
-# ==============================
-# KUCOIN DATA FUNCTIONS
-# ==============================
+# ===============================
+# TELEGRAM
+# ===============================
+
+def send_telegram(message):
+    token = st.secrets["TELEGRAM_TOKEN"]
+    chat_id = st.secrets["TELEGRAM_CHAT_ID"]
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    requests.post(url, data={"chat_id": chat_id, "text": message})
+
+
+# ===============================
+# KUCOIN DATA
+# ===============================
 
 def get_klines(symbol, interval):
     interval_map = {
         "15m": "15min",
-        "1h": "1hour",
         "4h": "4hour"
     }
 
-    url = f"https://api.kucoin.com/api/v1/market/candles"
-    params = {
-        "type": interval_map[interval],
-        "symbol": symbol,
-    }
+    url = "https://api.kucoin.com/api/v1/market/candles"
+    params = {"type": interval_map[interval], "symbol": symbol}
 
-    response = requests.get(url, params=params)
-    data = response.json()["data"]
+    r = requests.get(url, params=params)
+    data = r.json()["data"]
 
     df = pd.DataFrame(data)
     df = df.iloc[:, :6]
@@ -36,11 +46,31 @@ def get_klines(symbol, interval):
     return df
 
 
-# ==============================
-# ANALYZE FUNCTION
-# ==============================
+def get_funding(symbol):
+    try:
+        url = "https://api-futures.kucoin.com/api/v1/contracts/" + symbol
+        r = requests.get(url)
+        data = r.json()["data"]
+        return float(data["fundingFeeRate"])
+    except:
+        return 0.0
 
-def analyze(symbol):
+
+def get_open_interest(symbol):
+    try:
+        url = f"https://api-futures.kucoin.com/api/v1/openInterest?symbol={symbol}"
+        r = requests.get(url)
+        data = r.json()["data"]
+        return float(data["value"])
+    except:
+        return 0.0
+
+
+# ===============================
+# ANALYZE
+# ===============================
+
+def analyze(symbol, volume_mult, atr_mult, threshold):
 
     score = 0
 
@@ -62,7 +92,7 @@ def analyze(symbol):
     short_break = last["close"] < support
 
     avg_volume = df15["volume"].rolling(20).mean().iloc[-1]
-    volume_spike = last["volume"] > avg_volume * 1.3
+    volume_spike = last["volume"] > avg_volume * volume_mult
 
     df15["atr"] = ta.volatility.average_true_range(
         df15["high"], df15["low"], df15["close"], window=14
@@ -72,13 +102,13 @@ def analyze(symbol):
     atr_mean = df15["atr"].rolling(20).mean().iloc[-1]
 
     entry = last["close"]
-    stop = entry - atr
-    target = entry + (atr * 3)
+    stop = entry - (atr * atr_mult)
+    target = entry + (atr * atr_mult * 3)
 
     risk = abs((entry - stop) / entry) * 100
     reward = abs((target - entry) / entry) * 100
 
-    # SCORE
+    # ===== SCORING =====
     if long_break or short_break:
         score += 30
 
@@ -91,61 +121,129 @@ def analyze(symbol):
     if trend_up:
         score += 15
 
-    score = min(score, 100)
+    # ===== FUNDING & OI =====
+    funding = get_funding(symbol)
+    oi = get_open_interest(symbol)
 
-    # DECISION
-    if score >= 75 and long_break:
-        decision = "🟢 LONG SETUP UYGUN"
-    elif score >= 75 and short_break:
-        decision = "🔴 SHORT SETUP UYGUN"
-    elif score >= 60:
-        decision = "⚠️ BEKLE"
+    if abs(funding) < 0.01:
+        score += 10
     else:
-        decision = "❌ TRADE YOK"
+        score -= 5
 
-    return {
-        "score": score,
-        "decision": decision,
-        "entry": entry,
-        "stop": stop,
-        "target": target,
-        "rr": round(reward / risk, 2),
-        "df": df15
-    }
+    if oi > 0:
+        score += 5
+
+    score = min(max(score, 0), 100)
+
+    decision = None
+    if score >= threshold and long_break:
+        decision = "LONG"
+    elif score >= threshold and short_break:
+        decision = "SHORT"
+
+    return score, decision, entry, stop, target, df15, funding, oi
 
 
-# ==============================
+# ===============================
+# BACKTEST
+# ===============================
+
+def backtest(symbol, volume_mult, atr_mult):
+
+    df = get_klines(symbol, "15m")
+
+    wins = 0
+    losses = 0
+
+    df["atr"] = ta.volatility.average_true_range(
+        df["high"], df["low"], df["close"], window=14
+    )
+
+    for i in range(50, len(df)-10):
+
+        resistance = df["high"].iloc[i-20:i].max()
+        close = df["close"].iloc[i]
+
+        if close > resistance:
+
+            entry = close
+            atr = df["atr"].iloc[i]
+            stop = entry - atr
+            target = entry + atr * 3
+
+            future = df.iloc[i+1:i+10]
+
+            if future["high"].max() >= target:
+                wins += 1
+            elif future["low"].min() <= stop:
+                losses += 1
+
+    total = wins + losses
+    winrate = (wins/total)*100 if total > 0 else 0
+
+    return wins, losses, round(winrate,2)
+
+
+# ===============================
 # UI
-# ==============================
+# ===============================
 
-symbol = st.text_input("KuCoin Symbol (örn: BTC-USDT)", "BTC-USDT")
+st.sidebar.header("⚙ Ayarlar")
+
+coin_input = st.sidebar.text_area(
+    "Taranacak Coinler",
+    "BTC-USDT,ETH-USDT,SOL-USDT"
+)
+
+threshold = st.sidebar.slider("Score Threshold", 50, 90, 75)
+volume_mult = st.sidebar.slider("Hacim Çarpanı", 1.0, 3.0, 1.3)
+atr_mult = st.sidebar.slider("ATR Çarpanı", 0.5, 3.0, 1.0)
+
+COINS = [c.strip().upper() for c in coin_input.split(",")]
+
+# ===============================
+# MANUEL ANALİZ
+# ===============================
+
+symbol = st.text_input("Manuel Analiz", "BTC-USDT")
 
 if st.button("Analiz Et"):
 
-    data = analyze(symbol)
+    score, decision, entry, stop, target, df, funding, oi = analyze(
+        symbol, volume_mult, atr_mult, threshold
+    )
 
-    col1, col2 = st.columns(2)
+    st.metric("Confidence", score)
 
-    col1.metric("Confidence", data["score"])
-    col2.metric("R/R", data["rr"])
+    st.write("Funding:", funding)
+    st.write("Open Interest:", oi)
 
-    st.progress(data["score"] / 100)
-
-    st.subheader("🧠 Karar")
-    st.markdown(f"## {data['decision']}")
-
-    st.subheader("⚡ Risk")
-    st.write("Entry:", round(data["entry"],4))
-    st.write("Stop:", round(data["stop"],4))
-    st.write("Target:", round(data["target"],4))
+    if decision:
+        st.success(f"{decision} SETUP UYGUN")
+    else:
+        st.warning("Trade Yok")
 
     fig = go.Figure(data=[go.Candlestick(
-        x=data["df"].index,
-        open=data["df"]['open'],
-        high=data["df"]['high'],
-        low=data["df"]['low'],
-        close=data["df"]['close']
+        x=df.index,
+        open=df['open'],
+        high=df['high'],
+        low=df['low'],
+        close=df['close']
     )])
 
     fig.update_layout(xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
+
+
+# ===============================
+# BACKTEST BUTTON
+# ===============================
+
+if st.button("Backtest Yap"):
+
+    wins, losses, winrate = backtest(symbol, volume_mult, atr_mult)
+
+    st.subheader("📊 Backtest Sonucu")
+    st.write("Kazanan:", wins)
+    st.write("Kaybeden:", losses)
+    st.write("Winrate %:", winrate)
