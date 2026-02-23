@@ -4,7 +4,9 @@ import plotly.graph_objects as go
 from binance.client import Client
 import ta
 
-client = Client()
+client = Client(None, None)
+
+client.API_URL = "https://api.binance.com/api"
 
 st.set_page_config(page_title="Breakout AI Pro", layout="wide")
 st.title("🚀 Breakout Trading AI - Full Futures System")
@@ -180,3 +182,4 @@ if st.button("Analiz Et"):
     )])
     fig.update_layout(xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
+
